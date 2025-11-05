@@ -1,0 +1,128 @@
+# ==========================================
+# S1 统一版配置｜单模态光谱域自适应 + 先分类再定量（Soft Routing）
+# ==========================================
+# 说明：
+# - 本配置与 S1/train.py、eval.py、infer.py、export_onnx.py 保持一致；
+# - 可按需修改路径/类别数/光谱长度等；
+# - 训练阶段（pretrain/uda/ssda）与推理口径（soft/global_only）均可在此切换。
+
+project: "S1-unified-spectral"
+profile: "soft"          # 软加权口径：soft | 仅全局：global_only（评估/推理使用）
+
+device: "auto"           # auto|cpu|cuda
+seed: 42                 # 统一随机种子（见 mgtl/utils/seed.py）
+
+paths:
+  source_dir: "data/source"     # 源域（煤饼/实验室）
+  target_dir: "data/target"     # 目标域（煤粉/现场）
+  artifacts_dir: "artifacts"    # 输出目录（权重/日志/推理结果等）
+  class_map: "data/class_map.json"  # 可选：类别索引↔名称映射
+
+# —— 数据形状 ——
+spectral_length: 2048     # 光谱长度 L（训练/推理/导出需一致）
+n_classes: 6              # 类别数（煤种数）
+
+# —— 数据预处理 ——
+data:
+  normalize: "standard"   # 样本级标准化：none|standard|minmax
+  mmap: false             # 是否使用内存映射读取 NPY（超大数据建议 true）
+  # 若使用 transforms 进行增广/平滑，请将 normalize 按需调整，避免重复。
+
+# —— 模型结构（与 mgtl/models/*.py 对应） ——
+model:
+  d_model: 256
+  conv_channels: [64, 128]
+  conv_kernels:  [5, 3]
+  conv_dilation: [1, 2]
+  conv_stride:   [1, 1]
+  conv_pool: "none"            # none|avg|max
+  transformer_layers: 2
+  nhead: 4
+  dim_ff: 512
+  dropout: 0.10
+  activation: "gelu"           # gelu|relu
+  pooling: "mean"              # mean|cls
+  positional_encoding: "learned"  # learned|sinusoidal
+
+# —— 训练与迁移设置 ——
+train:
+  stage: "uda"                 # pretrain|uda|ssda
+  profile: "soft"              # 与顶层 profile 保持一致即可
+
+  batch_size: 64
+  num_workers: 2
+  pin_memory: true
+  shuffle: true
+  epochs: 50
+
+  # AMP & 早停
+  amp: true
+  early_stopping:
+    patience: 8
+    metric: "reg/rmse_macro"   # 监控指标（eval.py 输出键）
+    mode: "min"
+
+  # 优化器/调度器
+  optimizer:
+    name: "adamw"
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine"
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+
+  # 学习率多路与冻结策略（可选）
+  freeze:
+    encoder: false
+    classifier: false
+  lr_multipliers:
+    encoder: 1.0
+    heads: 1.0
+
+  # 损失权重（与 train.py 对齐）
+  loss_weights:
+    ce_weight: 1.0              # 分类交叉熵权重
+    softmix_weight: 1.0         # 软加权回归（Σ p_c y_c vs y）
+    per_class_reg_weight: 0.5   # 目标真实类别的回归头（y_{c*} vs y）
+    global_reg_weight: 0.5      # 全局回归（y_g vs y）
+    coral_weight: 0.1           # Deep CORAL（UDA/SSDA）
+    mean_align_weight: 0.0      # CORAL 可选均值对齐项权重
+    coral_normalize: "d2"       # none|d|d2|frob
+
+  # 分类不平衡（可选）
+  classification:
+    use_focal: false
+    focal_gamma: 2.0
+    focal_alpha: null           # 可设置为 [a0, a1, ...] 与类别对应
+
+  # UDA/SSDA 专属
+  uda:
+    target_batch_ratio: 1.0     # 每个源域 step 配一个目标域 batch
+  ssda:
+    labeled_ratio: 0.1          # 目标域少量标注比例（相对 target 全量）
+    epochs: 10
+
+# —— 推理口径（infer.py） ——
+infer:
+  tau: 0.6                      # 低置信回退阈值（soft 模式生效）
+  alpha: 0.2                    # 指数平滑系数（0 表示关闭）
+  fallback: "global"            # 回退占位（部署端策略识别标记）
+
+# —— 导出（export_onnx.py） ——
+export:
+  out: "artifacts/model.onnx"
+  onnx_opset: 17
+  dynamic_axes: true
+  simplify: true
+  fp16: false                   # 仅导出占位，真正 FP16 需在推理引擎侧实现或半精度权重
+
+# —— 日志与保存 ——
+logging:
+  level: "INFO"
+  logfile: "artifacts/train.log"
+
+save:
+  best_ckpt: "artifacts/best.pt"
+  monitor_metric: "reg/rmse_macro"
