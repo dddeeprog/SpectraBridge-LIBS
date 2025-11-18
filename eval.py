@@ -30,6 +30,8 @@ import yaml
 # —— 项目内 ——
 from mgtl.data import NpyDataset
 from mgtl.models import SpecEncoder, ClassifierHead, PerClassRegressors, GlobalRegressor
+from mgtl.utils.checkpoint import load_state_strict
+from mgtl.utils.config_checks import ConfigValidationError, validate_eval_config
 from mgtl.utils.metrics import RegressionMetrics, ClassificationMetrics
 from mgtl.utils.seed import set_seed, seed_worker, get_generator
 from mgtl.utils.logging import get_logger
@@ -144,9 +146,15 @@ def main():
     ap.add_argument("--domains", nargs="*", default=["source", "target"], choices=["source", "target"],
                     help="评估哪些域：source/target，多选")
     ap.add_argument("--out", type=str, default="artifacts/eval.json", help="输出指标 JSON 路径")
+    ap.add_argument("--allow-missing-keys", action="store_true",
+                    help="加载权重时若存在缺失/多余键则继续（默认严格校验并报错）")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    try:
+        validate_eval_config(cfg, args.domains)
+    except ConfigValidationError as err:
+        raise SystemExit(str(err)) from err
     logger = get_logger(level=cfg.get("logging", {}).get("level", "INFO"), logfile=cfg.get("logging", {}).get("logfile"))
 
     # 设备与随机性
@@ -161,9 +169,7 @@ def main():
 
     ckpt = torch.load(args.ckpt, map_location=device)
     state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        logger.warning(f"load_state: missing={len(missing)} unexpected={len(unexpected)}（阶段/形态变化常见）")
+    load_state_strict(model, state, allow_missing=args.allow_missing_keys, logger=logger)
 
     # DataLoader 参数
     L = int(cfg["spectral_length"])
