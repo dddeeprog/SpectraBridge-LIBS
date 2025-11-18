@@ -7,7 +7,8 @@ S1/infer.py —— 统一版推理脚本（含软加权回退、指数平滑、�
 - 读取 config.yaml 与权重，构建统一模型（共享编码器 + 分类/回归头）；
 - 从 `--input_dir` 读取 NPY/NPZ（X.npy 必需；y.npy/c.npy 可选）进行批量推理；
 - 输出逐样本 CSV：包含 y_global / y_soft / y_hat（口径选择+回退+平滑后）、分类 top1 与置信度；
-- 若提供 y/c，则计算回归/分类指标并可选写出 JSON（便于快速验收）。
+- 若提供 y/c，则计算回归/分类指标并可选写出 JSON（便于快速验收）；
+- 新增 `--obs_out` 推理概览（吞吐、置信度/回退率、元数据等）与 `--jsonl_out` 逐样本日志，方便接入监控与审计。
 
 软加权回退与平滑：
 - 先计算 soft 回归 y_soft = Σ softmax(logits)_c · y_per_class_c；
@@ -23,6 +24,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 
@@ -36,6 +40,8 @@ import yaml
 # —— 项目内 ——
 from mgtl.data import NpyDataset
 from mgtl.models import SpecEncoder, ClassifierHead, PerClassRegressors, GlobalRegressor
+from mgtl.utils.checkpoint import load_state_strict
+from mgtl.utils.config_checks import ConfigValidationError, validate_infer_config
 from mgtl.utils.metrics import RegressionMetrics, ClassificationMetrics
 from mgtl.utils.seed import set_seed, seed_worker, get_generator
 from mgtl.utils.logging import get_logger
@@ -137,7 +143,8 @@ def build_loader(data_dir: Path, L: int, normalize: str, batch_size: int, num_wo
 def run_infer(model: UnifiedModel, dl: DataLoader, device: torch.device, *,
               profile: str, tau: float, alpha: float,
               class_names: Optional[List[str]] = None,
-              has_y: bool = False, has_c: bool = False) -> Tuple[List[Dict], Dict[str, Dict[str, float]]]:
+              has_y: bool = False, has_c: bool = False,
+              logger=None) -> Tuple[List[Dict], Dict[str, Dict[str, float]], Dict[str, float]]:
     model.eval()
     records: List[Dict] = []
 
@@ -150,6 +157,16 @@ def run_infer(model: UnifiedModel, dl: DataLoader, device: torch.device, *,
     # EMA 平滑缓存
     y_ema = None
     idx_base = 0
+    obs_raw = {
+        "total_samples": 0,
+        "soft_selected": 0,
+        "global_fallback": 0,
+        "conf_sum": 0.0,
+        "conf_sq_sum": 0.0,
+        "conf_min": float("inf"),
+        "conf_max": float("-inf"),
+        "invalid_outputs": 0,
+    }
 
     for batch in dl:
         x = batch["x"].to(device)
@@ -179,6 +196,14 @@ def run_infer(model: UnifiedModel, dl: DataLoader, device: torch.device, *,
             # 写回平滑值
             y_hat_np[i] = y_ema
 
+        invalid_mask = ~np.isfinite(y_hat_np)
+        invalid_cnt = int(invalid_mask.sum())
+        if invalid_cnt:
+            obs_raw["invalid_outputs"] += invalid_cnt
+            if logger is not None:
+                logger.warning(f"检测到 {invalid_cnt} 个 NaN/Inf 推理结果，已以 0.0 填充")
+            y_hat_np[invalid_mask] = 0.0
+
         # 逐样本记录
         B = x.size(0)
         for i in range(B):
@@ -189,6 +214,7 @@ def run_infer(model: UnifiedModel, dl: DataLoader, device: torch.device, *,
                 "y_hat": float(y_hat_np[i]),
                 "cls_pred": int(cls_pred[i].detach().cpu()),
                 "cls_conf": float(conf[i].detach().cpu()),
+                "used_soft": int(use_soft[i].detach().cpu()),
             }
             if class_names is not None and 0 <= rec["cls_pred"] < len(class_names):
                 rec["cls_name"] = class_names[rec["cls_pred"]]
@@ -204,6 +230,16 @@ def run_infer(model: UnifiedModel, dl: DataLoader, device: torch.device, *,
                     rec["c_name"] = class_names[rec["c_true"]]
             records.append(rec)
         idx_base += B
+
+        conf_np = conf.detach().cpu().numpy().astype(np.float64)
+        use_soft_np = use_soft.detach().cpu().numpy().astype(np.int64)
+        obs_raw["total_samples"] += B
+        obs_raw["soft_selected"] += int(use_soft_np.sum())
+        obs_raw["global_fallback"] += int(B - use_soft_np.sum())
+        obs_raw["conf_sum"] += float(conf_np.sum())
+        obs_raw["conf_sq_sum"] += float(np.square(conf_np).sum())
+        obs_raw["conf_min"] = float(min(obs_raw["conf_min"], float(conf_np.min())))
+        obs_raw["conf_max"] = float(max(obs_raw["conf_max"], float(conf_np.max())))
 
         # 指标累计
         if has_y and (y is not None):
@@ -222,7 +258,27 @@ def run_infer(model: UnifiedModel, dl: DataLoader, device: torch.device, *,
     if has_c:
         metrics["cls"] = cls.compute(m_cls, prefix="cls/")
 
-    return records, metrics
+    obs: Dict[str, float] = {}
+    total = obs_raw["total_samples"]
+    obs["total_samples"] = total
+    obs["soft_selected"] = obs_raw["soft_selected"]
+    obs["global_fallback"] = obs_raw["global_fallback"]
+    obs["fallback_rate"] = (obs_raw["global_fallback"] / total) if total else 0.0
+    if total:
+        mean = obs_raw["conf_sum"] / total
+        var = max(obs_raw["conf_sq_sum"] / total - mean * mean, 0.0)
+        obs["cls_conf_mean"] = mean
+        obs["cls_conf_std"] = math.sqrt(var)
+        obs["cls_conf_min"] = obs_raw["conf_min"]
+        obs["cls_conf_max"] = obs_raw["conf_max"]
+    else:
+        obs["cls_conf_mean"] = 0.0
+        obs["cls_conf_std"] = 0.0
+        obs["cls_conf_min"] = 0.0
+        obs["cls_conf_max"] = 0.0
+    obs["invalid_outputs"] = obs_raw["invalid_outputs"]
+
+    return records, metrics, obs
 
 
 # ============================= 主入口 ============================= #
@@ -234,12 +290,18 @@ def main():
     ap.add_argument("--input_dir", type=str, default=None, help="输入目录（含 X.npy/y.npy/c.npy），默认取 config.paths.target_dir")
     ap.add_argument("--out", type=str, default="artifacts/infer.csv", help="输出 CSV 路径")
     ap.add_argument("--json_out", type=str, default=None, help="可选：输出指标 JSON 路径（存在 y/c 时有效）")
+    ap.add_argument("--obs_out", type=str, default=None,
+                    help="可选：输出推理概览 JSON（包含吞吐、回退率等可观测信息）")
+    ap.add_argument("--jsonl_out", type=str, default=None,
+                    help="可选：逐样本 JSON Lines 记录，便于实时监控/集成")
     ap.add_argument("--alpha", type=float, default=None, help="EMA 平滑系数（覆盖 config.infer.alpha）")
     ap.add_argument("--tau", type=float, default=None, help="软加权回退阈值（覆盖 config.infer.tau）")
     ap.add_argument("--profile", type=str, default=None, choices=["soft", "global_only"], help="推理口径（覆盖 config.profile）")
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--pin_memory", action="store_true")
+    ap.add_argument("--allow-missing-keys", action="store_true",
+                    help="加载权重时若存在缺失/多余键则继续（默认严格校验并报错）")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -262,30 +324,39 @@ def main():
 
     ckpt = torch.load(args.ckpt, map_location=device)
     state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        logger.warning(f"load_state: missing={len(missing)} unexpected={len(unexpected)}（阶段/形态变化常见）")
+    load_state_strict(model, state, allow_missing=args.allow_missing_keys, logger=logger)
 
     # 数据
     L = int(cfg["spectral_length"])
     normalize = cfg.get("data", {}).get("normalize", "standard")
     input_dir = Path(args.input_dir or cfg["paths"]["target_dir"]).expanduser()
+    try:
+        validate_infer_config(cfg, input_dir=input_dir, alpha=alpha, tau=tau, profile=profile)
+    except ConfigValidationError as err:
+        raise SystemExit(str(err)) from err
     dl = build_loader(input_dir, L, normalize, args.batch_size, args.num_workers, args.pin_memory, seed)
 
     # 类别名称（可选）
     class_map = load_class_map(Path(cfg.get("paths", {}).get("class_map", "")))
 
     # 推理
-    records, metrics = run_infer(model, dl, device, profile=profile, tau=tau, alpha=alpha,
-                                 class_names=class_map,
-                                 has_y=(input_dir / "y.npy").exists(),
-                                 has_c=(input_dir / "c.npy").exists())
+    has_y = (input_dir / "y.npy").exists()
+    has_c = (input_dir / "c.npy").exists()
+    wall_start = time.perf_counter()
+    records, metrics, obs_stats = run_infer(
+        model, dl, device, profile=profile, tau=tau, alpha=alpha,
+        class_names=class_map,
+        has_y=has_y,
+        has_c=has_c,
+        logger=logger,
+    )
+    runtime = time.perf_counter() - wall_start
 
     # 写 CSV
     out_csv = Path(args.out)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     header = [
-        "idx", "y_global", "y_soft", "y_hat", "cls_pred", "cls_conf",
+        "idx", "y_global", "y_soft", "y_hat", "cls_pred", "cls_conf", "used_soft",
         "cls_name", "y_true", "abs_err_hat", "abs_err_soft", "abs_err_global", "c_true", "c_name"
     ]
     # 仅输出存在的列
@@ -306,6 +377,49 @@ def main():
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump({"profile": profile, "alpha": alpha, "tau": tau, "metrics": metrics}, f, ensure_ascii=False, indent=2)
         logger.info(f"infer metrics → {out_json}")
+
+    # 可观测性摘要
+    obs_stats["runtime_sec"] = runtime
+    obs_stats["throughput_sps"] = (obs_stats["total_samples"] / runtime) if runtime > 0 else None
+    obs_stats["profile"] = profile
+    obs_stats["alpha"] = alpha
+    obs_stats["tau"] = tau
+    obs_stats["batch_size"] = args.batch_size
+    obs_stats["num_workers"] = args.num_workers
+    obs_payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "config": str(Path(args.config).resolve()),
+        "ckpt": str(Path(args.ckpt).resolve()),
+        "input_dir": str(input_dir.resolve()),
+        "has_regression_labels": has_y,
+        "has_class_labels": has_c,
+        "model_params": sum(p.numel() for p in model.parameters()),
+        "stats": obs_stats,
+        "metrics": metrics,
+    }
+    if args.obs_out is not None:
+        obs_path = Path(args.obs_out)
+        obs_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(obs_path, "w", encoding="utf-8") as f:
+            json.dump(obs_payload, f, ensure_ascii=False, indent=2)
+        logger.info(f"infer observability summary → {obs_path}")
+    else:
+        logger.info(
+            "可观测性摘要：samples=%d fallback_rate=%.3f throughput=%.2f samples/s",
+            obs_stats["total_samples"],
+            obs_stats.get("fallback_rate", 0.0),
+            obs_stats.get("throughput_sps") or 0.0,
+        )
+
+    # JSONL 逐样本记录（用于实时监控）
+    if args.jsonl_out is not None:
+        jsonl_path = Path(args.jsonl_out)
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False))
+                f.write("\n")
+        logger.info(f"infer jsonl records → {jsonl_path}")
 
     logger.info("推理完成。")
 

@@ -182,8 +182,9 @@ def load_files_mode(folder: Path,
                     label_map: Optional[Path],
                     filename_regex: Optional[str],
                     normalize: str = "none") -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-    """从目录读取多个 CSV 文件，每个文件一条样本。
-    支持两列 [wavelength,intensity] 或单列强度（默认等距）。
+    """从目录读取多个 CSV 文件。默认每个文件包含 >=1 条样本。
+    支持两列 [wavelength,intensity]、单列强度（默认等距），
+    以及“首列为波长、其余列为多条强度”的批量记录格式。
     标签可由 label_map.csv 或文件名正则提取；两者皆无时仅导出 X.npy。
     label_map.csv 需要包含列：file(文件名或相对路径)，可选 y、c。
     """
@@ -204,20 +205,53 @@ def load_files_mode(folder: Path,
 
     for f in files:
         df = pd.read_csv(f, header=None)
+        # 将所有值转为数值，方便自动过滤“wavelength,Spec1,...”之类的表头；
+        # 若整行/整列均为 NaN，则视为无效并剔除。
+        df = df.apply(pd.to_numeric, errors="coerce")
+        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+        df = df.reset_index(drop=True)
+        if df.empty:
+            raise ValueError(f"文件 {f} 转成数值后为空，请确认是否包含有效光谱。")
+
+        wave_values: Optional[np.ndarray] = None
+        wave_mask: Optional[np.ndarray] = None
         if df.shape[1] >= 2:
-            wave = df.iloc[:, 0].to_numpy()
-            inten = df.iloc[:, 1].to_numpy()
-            x = resample_to_grid(wave, inten, spectral_length, wavemin, wavemax)
-        else:
-            inten = df.iloc[:, 0].to_numpy(dtype=np.float32)
-            K = inten.shape[0]
-            if K == spectral_length:
-                x = inten.astype(np.float32)
+            wave_values = df.iloc[:, 0].to_numpy(dtype=np.float64)
+            if not np.isfinite(wave_values).all():
+                wave_mask = np.isfinite(wave_values)
+                valid_cnt = int(wave_mask.sum())
+                if valid_cnt < 2:
+                    raise ValueError(f"文件 {f} 的波长列有效值不足，无法重采样。")
             else:
-                src_idx = np.linspace(0, 1, K)
-                dst_idx = np.linspace(0, 1, spectral_length)
-                x = np.interp(dst_idx, src_idx, inten).astype(np.float32)
-        X_list.append(x)
+                wave_mask = None
+
+        def append_sample(inten_arr: np.ndarray):
+            if inten_arr.ndim != 1:
+                inten = inten_arr.to_numpy()
+            else:
+                inten = inten_arr
+            inten = np.asarray(inten, dtype=np.float64)
+            if wave_values is not None:
+                wave = wave_values
+                if wave_mask is not None:
+                    inten = inten[wave_mask]
+                    wave = wave[wave_mask]
+                if inten.shape[0] != wave.shape[0]:
+                    raise ValueError(f"文件 {f} 中波长与强度长度不一致：{wave.shape[0]} vs {inten.shape[0]}")
+                x = resample_to_grid(wave, inten, spectral_length, wavemin, wavemax)
+            else:
+                K = inten.shape[0]
+                if K == spectral_length:
+                    x = inten.astype(np.float32)
+                else:
+                    src_idx = np.linspace(0, 1, K)
+                    dst_idx = np.linspace(0, 1, spectral_length)
+                    x = np.interp(dst_idx, src_idx, inten).astype(np.float32)
+            X_list.append(x)
+            if y_val is not None:
+                y_list.append(float(y_val))
+            if c_val is not None:
+                c_list.append(int(c_val))
 
         # 标签：label_map 优先；否则正则尝试
         y_val: Optional[float] = None
@@ -234,10 +268,13 @@ def load_files_mode(folder: Path,
             y2, c2 = parse_labels_by_regex(f.name, filename_regex)
             y_val = y_val if y_val is not None else y2
             c_val = c_val if c_val is not None else c2
-        if y_val is not None:
-            y_list.append(float(y_val))
-        if c_val is not None:
-            c_list.append(int(c_val))
+
+        if df.shape[1] >= 2:
+            # 每一列（除首列波长）代表一个光谱。
+            for col_idx in range(1, df.shape[1]):
+                append_sample(df.iloc[:, col_idx])
+        else:
+            append_sample(df.iloc[:, 0])
 
     X = np.stack(X_list, axis=0).astype(np.float32)
     X = standardize(X, normalize)

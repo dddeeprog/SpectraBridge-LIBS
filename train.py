@@ -31,6 +31,8 @@ from torch.utils.data import DataLoader
 from mgtl.data import NpyDataset, NpyDualIter
 from mgtl.models import SpecEncoder, ClassifierHead, PerClassRegressors, GlobalRegressor
 from mgtl.losses import coral_loss, FocalLoss
+from mgtl.utils.checkpoint import load_state_strict
+from mgtl.utils.config_checks import ConfigValidationError, validate_training_config
 from mgtl.utils.metrics import RegressionMetrics, ClassificationMetrics
 from mgtl.utils.seed import set_seed, seed_worker, get_generator
 from mgtl.utils.logging import get_logger, Progress
@@ -414,9 +416,15 @@ def main():
     ap.add_argument("--config", type=str, required=True, help="配置文件路径（config.yaml）")
     ap.add_argument("--resume", type=str, default=None, help="从权重恢复/热启动训练（可选）")
     ap.add_argument("--save", type=str, default=None, help="最佳权重保存路径（默认取 config.save.best_ckpt）")
+    ap.add_argument("--allow-missing-keys", action="store_true",
+                    help="加载权重时若存在缺失/多余键则继续（默认严格校验并报错）")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    try:
+        validate_training_config(cfg)
+    except ConfigValidationError as err:
+        raise SystemExit(str(err)) from err
     logger = get_logger(level=cfg.get("logging", {}).get("level", "INFO"), logfile=cfg.get("logging", {}).get("logfile"))
 
     # 设备与随机性
@@ -435,9 +443,7 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            logger.warning(f"load_state: missing={len(missing)} unexpected={len(unexpected)}（阶段/形态变化常见）")
+        load_state_strict(model, state, allow_missing=args.allow_missing_keys, logger=logger)
 
     # 优化器与调度器
     opt = build_optimizer(model, tc)
